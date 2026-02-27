@@ -1,41 +1,34 @@
 import 'package:flutter/material.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
-import 'package:collection/collection.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
-
-class SensorData {
-  final double spectroscopy;
-  final double ppg;
-  final DateTime timestamp;
-
-  SensorData({required this.spectroscopy, required this.ppg, required this.timestamp});
-
-  factory SensorData.fromJson(Map<String, dynamic> json) {
-    return SensorData(
-      spectroscopy: json['Spectrscopy data']?.toDouble() ?? 0.0,
-      ppg: json['PPG Data ']?.toDouble() ?? 0.0,
-      timestamp: DateTime.fromMillisecondsSinceEpoch(json['timestamp'] ?? 0),
-    );
-  }
-}
+import '../models/spectral_data_model.dart';
 
 class MqttService extends ChangeNotifier {
   late MqttServerClient _client;
-  List<SensorData> _dataHistory = [];
-  SensorData? _latestData;
+  List<SpectralReading> _dataHistory = [];
+  SpectralReading? _latestData;
   bool _isConnected = false;
   bool _isConnecting = false;
   String? _connectionError;
   Timer? _retryTimer;
   int _messageCount = 0;
 
-  List<SensorData> get dataHistory => _dataHistory;
-  SensorData? get latestData => _latestData;
+  // Callback for when new data is received (for saving to user)
+  Function(SpectralReading)? onDataReceived;
+
+  // Capture mode state
+  bool _isCapturing = false;
+  List<SpectralReading> _capturedReadings = [];
+  Function(SpectralReading)? _captureCallback;
+
+  List<SpectralReading> get dataHistory => _dataHistory;
+  SpectralReading? get latestData => _latestData;
   bool get isConnected => _isConnected;
   bool get isConnecting => _isConnecting;
+  bool get isCapturing => _isCapturing;
   String? get connectionError => _connectionError;
   int get messageCount => _messageCount;
 
@@ -43,7 +36,7 @@ class MqttService extends ChangeNotifier {
   final String _password = 'public';
   final String _broker = 'broker.emqx.io';
   final int _port = 1883;
-  final String _topic = 'emqx/esp8266/major';  // Centralized topic
+  final String _topic = 'emqx/esp8266/blood';
 
   MqttService() {
     print('═══════════════════════════════════════');
@@ -51,7 +44,6 @@ class MqttService extends ChangeNotifier {
     print('═══════════════════════════════════════');
     print('Broker: $_broker:$_port');
     print('Topic: $_topic');
-    print('Username: $_username');
     print('═══════════════════════════════════════\n');
 
     _initializeClient();
@@ -64,14 +56,12 @@ class MqttService extends ChangeNotifier {
 
     _client = MqttServerClient.withPort(_broker, clientId, _port);
 
-    // CRITICAL FIX: Set secure to false for plain MQTT
     _client.secure = false;
-    _client.logging(on: true);
-    _client.keepAlivePeriod = 20;  // Reduced from 60
-    _client.connectTimeoutPeriod = 10000;  // Increased to 10 seconds
+    _client.logging(on: false);
+    _client.keepAlivePeriod = 20;
+    _client.connectTimeoutPeriod = 10000;
     _client.autoReconnect = false;
 
-    // Set the protocol to V3.1.1 (more compatible)
     _client.setProtocolV311();
 
     _client.onDisconnected = _onDisconnected;
@@ -81,14 +71,14 @@ class MqttService extends ChangeNotifier {
     _client.connectionMessage = MqttConnectMessage()
         .withClientIdentifier(_client.clientIdentifier)
         .startClean()
-        .withWillQos(MqttQos.atMostOnce)  // Changed from atLeastOnce
-        .keepAliveFor(20);  // Match keepAlivePeriod
+        .withWillQos(MqttQos.atMostOnce)
+        .keepAliveFor(20);
 
     _client.pongCallback = () {
-      print('🏓 PING response received (connection alive)');
+      print('🏓 PING response received');
     };
 
-    print('✓ Client initialized successfully\n');
+    print('✓ Client initialized\n');
   }
 
   Future<void> connect() async {
@@ -102,30 +92,21 @@ class MqttService extends ChangeNotifier {
     notifyListeners();
 
     print('🔌 Connecting to MQTT broker...');
-    print('   Host: $_broker:$_port');
-    print('   Username: $_username');
 
     try {
       if (_client.connectionStatus?.state == MqttConnectionState.disconnected) {
-        print('🔄 Reinitializing client (was disconnected)...');
         _initializeClient();
       }
 
       final connStatus = await _client.connect(_username, _password);
 
-      print('📊 Connection attempt result:');
-      print('   State: ${connStatus?.state}');
-      print('   Return Code: ${connStatus?.returnCode}');
-
       if (connStatus?.state == MqttConnectionState.connected) {
         print('✅ CONNECTION SUCCESSFUL!\n');
       } else {
-        final errorMsg = 'Connection failed - State: ${connStatus?.state}, Code: ${connStatus?.returnCode}';
-        print('❌ $errorMsg\n');
-        throw Exception(errorMsg);
+        throw Exception('Connection failed - State: ${connStatus?.state}');
       }
     } on TimeoutException catch (e) {
-      _connectionError = 'Connection timeout - Check network/broker availability';
+      _connectionError = 'Connection timeout';
       _isConnecting = false;
       notifyListeners();
       print('❌ TIMEOUT: $e\n');
@@ -137,7 +118,7 @@ class MqttService extends ChangeNotifier {
       print('❌ SOCKET ERROR: $e\n');
       _scheduleRetry();
     } on NoConnectionException catch (e) {
-      _connectionError = 'No connection exception - ${e.toString()}';
+      _connectionError = 'No connection';
       _isConnecting = false;
       notifyListeners();
       print('❌ NO CONNECTION: $e\n');
@@ -152,19 +133,15 @@ class MqttService extends ChangeNotifier {
   }
 
   void _onConnected() {
-    print('═══════════════════════════════════════');
-    print('   ✅ MQTT CONNECTED!');
-    print('═══════════════════════════════════════');
+    print('✅ MQTT CONNECTED!');
 
     _isConnected = true;
     _isConnecting = false;
     _connectionError = null;
     _retryTimer?.cancel();
 
-    print('📡 Subscribing to topic: $_topic');
     _client.subscribe(_topic, MqttQos.atLeastOnce);
 
-    print('👂 Setting up message listener...');
     _client.updates?.listen(
           (List<MqttReceivedMessage<MqttMessage>>? c) {
         _handleIncomingMessage(c);
@@ -172,27 +149,17 @@ class MqttService extends ChangeNotifier {
       onError: (error) {
         print('❌ Listener error: $error');
       },
-      onDone: () {
-        print('⚠️  Listener closed');
-      },
     );
 
-    print('✓ Ready to receive messages!\n');
     notifyListeners();
   }
 
   void _onSubscribed(String topic) {
-    print('═══════════════════════════════════════');
-    print('   ✅ SUBSCRIBED to: $topic');
-    print('═══════════════════════════════════════');
-    print('Waiting for messages from ESP32...\n');
+    print('✅ SUBSCRIBED to: $topic');
   }
 
   void _onDisconnected() {
-    print('═══════════════════════════════════════');
-    print('   ❌ MQTT DISCONNECTED!');
-    print('═══════════════════════════════════════\n');
-
+    print('❌ MQTT DISCONNECTED!');
     _isConnected = false;
     _isConnecting = false;
     notifyListeners();
@@ -200,87 +167,116 @@ class MqttService extends ChangeNotifier {
   }
 
   void _handleIncomingMessage(List<MqttReceivedMessage<MqttMessage>>? c) {
-    if (c == null || c.isEmpty) {
-      print('⚠️  Received empty message list');
-      return;
-    }
+    if (c == null || c.isEmpty) return;
 
     try {
       final recMess = c[0].payload as MqttPublishMessage;
       final payload = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
 
       _messageCount++;
-
-      print('═══════════════════════════════════════');
-      print('   📨 MESSAGE #$_messageCount RECEIVED');
-      print('═══════════════════════════════════════');
-      print('Topic: ${c[0].topic}');
-      print('Payload: $payload');
-      print('Size: ${payload.length} characters');
+      print('📨 Message #$_messageCount received');
 
       _parseAndUpdateData(payload);
-
-      print('═══════════════════════════════════════\n');
     } catch (e) {
-      print('❌ Error handling message: $e\n');
+      print('❌ Error handling message: $e');
     }
   }
 
   void _scheduleRetry() {
     _retryTimer?.cancel();
-    print('⏰ Scheduling reconnection in 10 seconds...\n');
+    print('⏰ Reconnecting in 10 seconds...');
     _retryTimer = Timer(const Duration(seconds: 10), () {
-      print('🔄 Retry timer triggered - attempting reconnection...\n');
       connect();
     });
   }
 
   void _parseAndUpdateData(String jsonString) {
     try {
-      print('🔍 Parsing JSON...');
       final jsonData = jsonDecode(jsonString);
-      print('   Raw JSON: $jsonData');
+      final data = SpectralReading.fromMqttJson(jsonData);
 
-      final data = SensorData.fromJson(jsonData);
       _latestData = data;
       _dataHistory.add(data);
 
-      if (_dataHistory.length > 50) {
+      if (_dataHistory.length > 100) {
         _dataHistory.removeAt(0);
+      }
+
+      // Notify callback if set
+      if (onDataReceived != null) {
+        onDataReceived!(data);
+      }
+
+      // Handle capture mode
+      if (_isCapturing) {
+        _capturedReadings.add(data);
+        if (_captureCallback != null) {
+          _captureCallback!(data);
+        }
       }
 
       notifyListeners();
 
-      print('✅ Data parsed successfully:');
-      print('   Spectroscopy: ${data.spectroscopy}');
-      print('   PPG: ${data.ppg}');
-      print('   Timestamp: ${data.timestamp}');
-      print('   History size: ${_dataHistory.length}');
+      print('✅ Data parsed: Label=${data.label}, NIR=${data.channels.nir}');
     } catch (e) {
-      print('❌ JSON PARSE ERROR: $e');
-      print('   Raw data: $jsonString');
-      print('   Length: ${jsonString.length} characters');
-
-      // Try to show what went wrong
-      try {
-        final decoded = jsonDecode(jsonString);
-        print('   Decoded structure: ${decoded.runtimeType}');
-        print('   Keys: ${decoded is Map ? decoded.keys.toList() : "Not a map"}');
-      } catch (e2) {
-        print('   Could not decode at all: $e2');
-      }
+      print('❌ Parse error: $e');
+      print('   Raw: $jsonString');
     }
   }
 
+  // Get channel history for charts
+  List<double> getChannelHistory(String channelName, {int maxPoints = 50}) {
+    return _dataHistory.reversed.take(maxPoints).map((data) {
+      final channels = data.channels;
+      switch (channelName) {
+        case 'NIR': return channels.nir.toDouble();
+        case 'F7_630nm': return channels.f7_630nm.toDouble();
+        case 'F8_680nm': return channels.f8_680nm.toDouble();
+        case 'Clear': return channels.clearChannel.toDouble();
+        default: return 0.0;
+      }
+    }).toList().reversed.toList();
+  }
+
+  void clearHistory() {
+    _dataHistory.clear();
+    _messageCount = 0;
+    notifyListeners();
+  }
+
+  // Start capturing readings
+  void startCapturing({Function(SpectralReading)? onData}) {
+    _isCapturing = true;
+    _capturedReadings.clear();
+    _captureCallback = onData;
+    notifyListeners();
+    print('🎯 Started capturing readings');
+  }
+
+  // Stop capturing and return captured readings
+  List<SpectralReading> stopCapturing() {
+    _isCapturing = false;
+    final readings = List<SpectralReading>.from(_capturedReadings);
+    _captureCallback = null;
+    notifyListeners();
+    print('🛑 Stopped capturing. Total readings: ${readings.length}');
+    return readings;
+  }
+
+  // Clear captured readings
+  void clearCapturedReadings() {
+    _capturedReadings.clear();
+    notifyListeners();
+  }
+
   void disconnect() {
-    print('🔌 Manual disconnect requested');
+    print('🔌 Disconnecting...');
     _retryTimer?.cancel();
     _client.disconnect();
   }
 
   @override
   void dispose() {
-    print('🗑️  Disposing MQTT service');
     _retryTimer?.cancel();
     _client.disconnect();
     super.dispose();
